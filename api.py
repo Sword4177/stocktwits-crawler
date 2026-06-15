@@ -2,16 +2,20 @@
 api.py — FastAPI 对外接口
 运行：uvicorn api:app --reload --port 8001
 """
-import sqlite3
+import time
+import json
+from collections import defaultdict
 from typing import Optional
-from fastapi import FastAPI, Query
+from fastapi import FastAPI, Query, Depends, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from database import get_conn, init_db
+from config import API_KEY
 
 app = FastAPI(
-    title="SentinelFlow StockTwits API",
+    title="StockTwits Sentiment API",
     description="散户情绪监控 API — 提供 Trending 排行、热度异动信号、帖子数据",
-    version="1.0.0",
+    version="2.0.0",
 )
 
 app.add_middleware(
@@ -21,13 +25,69 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# ── Rate limiting (60 req/min per IP) ─────────────────────────────────────────
+_rate_store: dict[str, list[float]] = defaultdict(list)
+RATE_LIMIT = 60
+RATE_WINDOW = 60.0
+
+
+def check_rate_limit(request: Request):
+    ip = request.client.host
+    now = time.time()
+    hits = [t for t in _rate_store[ip] if now - t < RATE_WINDOW]
+    if len(hits) >= RATE_LIMIT:
+        raise HTTPException(status_code=429, detail="Rate limit exceeded: 60 req/min")
+    hits.append(now)
+    _rate_store[ip] = hits
+
+
+# ── Auth ───────────────────────────────────────────────────────────────────────
+def require_api_key(request: Request):
+    if not API_KEY:
+        return  # no key configured → open
+    key = request.headers.get("X-API-Key") or request.query_params.get("api_key")
+    if key != API_KEY:
+        raise HTTPException(status_code=401, detail="Invalid or missing X-API-Key")
+
+
+DEPS = [Depends(check_rate_limit), Depends(require_api_key)]
+
+
+# ── DB helpers ─────────────────────────────────────────────────────────────────
+def _is_pg(conn) -> bool:
+    try:
+        import psycopg2
+        return isinstance(conn, psycopg2.extensions.connection)
+    except ImportError:
+        return False
+
 
 def query(sql: str, params: tuple = ()) -> list[dict]:
     conn = get_conn()
-    conn.row_factory = sqlite3.Row
-    rows = conn.execute(sql, params).fetchall()
-    conn.close()
-    return [dict(r) for r in rows]
+    pg = _is_pg(conn)
+    if pg:
+        import psycopg2.extras
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute(sql, params)
+        rows = cur.fetchall()
+        cur.close()
+        conn.close()
+        return [dict(r) for r in rows]
+    else:
+        import sqlite3
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(sql, params).fetchall()
+        conn.close()
+        return [dict(r) for r in rows]
+
+
+def _interval(window: str, pg: bool) -> str:
+    """Convert window string to SQL interval expression."""
+    mapping = {"1h": ("1", "-1 hours"), "4h": ("4", "-4 hours"), "24h": ("24", "-24 hours")}
+    hours, sqlite_delta = mapping.get(window, ("24", "-24 hours"))
+    if pg:
+        return f"NOW() - INTERVAL '{hours} hours'"
+    return f"datetime('now', '{sqlite_delta}')"
 
 
 @app.on_event("startup")
@@ -37,82 +97,162 @@ def startup():
     conn.close()
 
 
+# ── Health ─────────────────────────────────────────────────────────────────────
 @app.get("/", tags=["Health"])
 def root():
-    return {"status": "ok", "service": "SentinelFlow StockTwits API", "version": "1.0.0"}
+    return {"status": "ok", "service": "SentinelFlow StockTwits API", "version": "2.0.0"}
 
 
-@app.get("/api/posts")
-def get_posts(
-    symbol:    Optional[str] = Query(None, description="股票代码，如 NVDA"),
-    source:    Optional[str] = Query(None, description="来源：symbol 或 trending"),
-    sentiment: Optional[str] = Query(None, description="情绪：Bullish 或 Bearish"),
-    limit:     int           = Query(50, ge=1, le=500),
-    offset:    int           = Query(0, ge=0),
+# ══════════════════════════════════════════════════════════════════════════════
+# ARTI Endpoints
+# ══════════════════════════════════════════════════════════════════════════════
+
+@app.get("/api/signals/trending", tags=["ARTI"], dependencies=DEPS)
+def signals_trending(
+    sector: Optional[str] = Query(None, description="板块过滤: semiconductor | ai | all"),
+    window: str           = Query("24h", description="时间窗口: 1h | 4h | 24h"),
+    limit:  int           = Query(20, ge=1, le=100),
 ):
-    conditions, params = [], []
+    """热度排行：按提及量降序，返回 sentiment_score 和 buzz 倍数。"""
+    conn = get_conn()
+    pg = _is_pg(conn)
+    conn.close()
+    since = _interval(window, pg)
+    ph = "%s" if pg else "?"
 
-    if symbol:
-        conditions.append("symbol = ?")
-        params.append(symbol.upper())
-    if source:
-        conditions.append("source = ?")
-        params.append(source)
-    if sentiment:
-        conditions.append("sentiment = ?")
-        params.append(sentiment)
+    sector_filter = ""
+    params: list = []
+    if sector and sector != "all":
+        sector_filter = f"AND LOWER(s.sector) LIKE {ph}"
+        params.append(f"%{sector.lower()}%")
 
-    where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
-    params += [limit, offset]
+    params += [limit]
 
-    rows = query(
-        f"SELECT * FROM posts {where} ORDER BY published_at DESC LIMIT ? OFFSET ?",
-        tuple(params),
-    )
-    return {"total": len(rows), "offset": offset, "data": rows}
-
-
-@app.get("/api/posts/{post_id}")
-def get_post(post_id: str):
-    rows = query("SELECT * FROM posts WHERE id = ?", (post_id,))
-    if not rows:
-        from fastapi import HTTPException
-        raise HTTPException(status_code=404, detail="Post not found")
-    return rows[0]
-
-
-@app.get("/api/trending")
-def get_trending(days: int = Query(30, ge=1, le=90), limit: int = Query(25, ge=1, le=100)):
-    rows = query("""
+    sql = f"""
         SELECT p.symbol,
                COALESCE(s.sector, '') AS sector,
                COUNT(*) AS mentions,
-               SUM(CASE WHEN p.sentiment='Bullish' THEN 1 ELSE 0 END) AS bullish,
-               SUM(CASE WHEN p.sentiment='Bearish' THEN 1 ELSE 0 END) AS bearish,
-               ROUND(COUNT(*) * 1.0 / ?, 1) AS daily_avg
+               SUM(CASE WHEN p.sentiment='Bullish' THEN 1 ELSE 0 END) AS bullish_count,
+               SUM(CASE WHEN p.sentiment='Bearish' THEN 1 ELSE 0 END) AS bearish_count,
+               ROUND(
+                   (SUM(CASE WHEN p.sentiment='Bullish' THEN 1.0 ELSE 0 END) -
+                    SUM(CASE WHEN p.sentiment='Bearish' THEN 1.0 ELSE 0 END))
+                   / NULLIF(COUNT(*), 0), 4
+               ) AS sentiment_score
         FROM posts p
         LEFT JOIN symbols s ON p.symbol = s.symbol
-        WHERE p.published_at >= datetime('now', ? || ' days')
-        GROUP BY p.symbol
+        WHERE p.published_at >= {since}
+          {sector_filter}
+        GROUP BY p.symbol, s.sector
         ORDER BY mentions DESC
-        LIMIT ?
-    """, (days, f'-{days}', limit))
-    return {"days": days, "total": len(rows), "data": rows}
+        LIMIT {ph}
+    """
+    rows = query(sql, tuple(params))
+    return {"window": window, "sector": sector or "all", "total": len(rows), "data": rows}
 
 
-@app.get("/api/signals")
-def get_signals():
-    rows = query("""
+@app.get("/api/signals/ticker/{symbol}", tags=["ARTI"], dependencies=DEPS)
+def signals_ticker(
+    symbol: str,
+    window: str = Query("24h", description="时间窗口: 1h | 4h | 24h"),
+):
+    """单 ticker 情绪快照：sentiment_score、buzz_ratio、top3 帖子。"""
+    sym = symbol.upper()
+    conn = get_conn()
+    pg = _is_pg(conn)
+    conn.close()
+    since = _interval(window, pg)
+    ph = "%s" if pg else "?"
+
+    agg = query(f"""
+        SELECT COUNT(*) AS mentions,
+               SUM(CASE WHEN sentiment='Bullish' THEN 1 ELSE 0 END) AS bullish_count,
+               SUM(CASE WHEN sentiment='Bearish' THEN 1 ELSE 0 END) AS bearish_count,
+               ROUND(
+                   (SUM(CASE WHEN sentiment='Bullish' THEN 1.0 ELSE 0 END) -
+                    SUM(CASE WHEN sentiment='Bearish' THEN 1.0 ELSE 0 END))
+                   / NULLIF(COUNT(*), 0), 4
+               ) AS sentiment_score
+        FROM posts
+        WHERE symbol = {ph} AND published_at >= {since}
+    """, (sym,))
+
+    if not agg or agg[0]["mentions"] == 0:
+        raise HTTPException(status_code=404, detail=f"No data for {sym} in window {window}")
+
+    # 7-day baseline for buzz ratio
+    if pg:
+        baseline_since = "NOW() - INTERVAL '7 days'"
+    else:
+        baseline_since = "datetime('now', '-7 days')"
+
+    baseline = query(f"""
+        SELECT COUNT(*) * 1.0 / 7 AS daily_avg
+        FROM posts
+        WHERE symbol = {ph} AND published_at >= {baseline_since}
+    """, (sym,))
+    daily_avg = baseline[0]["daily_avg"] or 0
+
+    # window hours for buzz_ratio denominator
+    hours = {"1h": 1, "4h": 4, "24h": 24}.get(window, 24)
+    window_avg = daily_avg / 24 * hours
+    mentions = agg[0]["mentions"]
+    buzz_ratio = round(mentions / window_avg, 2) if window_avg > 0 else None
+
+    top3 = query(f"""
+        SELECT id, body, sentiment, likes, published_at
+        FROM posts
+        WHERE symbol = {ph} AND published_at >= {since}
+        ORDER BY likes DESC, published_at DESC
+        LIMIT 3
+    """, (sym,))
+
+    return {
+        "symbol": sym,
+        "window": window,
+        "mentions": mentions,
+        "bullish_count": agg[0]["bullish_count"],
+        "bearish_count": agg[0]["bearish_count"],
+        "sentiment_score": agg[0]["sentiment_score"],
+        "buzz_baseline_per_window": round(window_avg, 1),
+        "buzz_ratio": buzz_ratio,
+        "top_posts": top3,
+    }
+
+
+@app.get("/api/signals/alerts", tags=["ARTI"], dependencies=DEPS)
+def signals_alerts(
+    limit: int = Query(20, ge=1, le=100),
+):
+    """
+    实时异动预警：
+    - buzz_spike: 近24h提及量 >= 7日均值 1.5x，且股价变动 < 3%
+    - sentiment_shift: 近4h情绪分 与24h均值偏差 > 0.3
+    """
+    conn = get_conn()
+    pg = _is_pg(conn)
+    conn.close()
+    ph = "%s" if pg else "?"
+
+    if pg:
+        since_24h = "NOW() - INTERVAL '24 hours'"
+        since_4h  = "NOW() - INTERVAL '4 hours'"
+        since_7d  = "NOW() - INTERVAL '7 days'"
+    else:
+        since_24h = "datetime('now', '-24 hours')"
+        since_4h  = "datetime('now', '-4 hours')"
+        since_7d  = "datetime('now', '-7 days')"
+
+    buzz_spikes = query(f"""
         WITH recent AS (
             SELECT symbol, COUNT(*) AS cnt
-            FROM posts WHERE published_at >= datetime('now', '-1 day')
+            FROM posts WHERE published_at >= {since_24h}
             GROUP BY symbol
         ),
-        avg30 AS (
-            SELECT symbol, COUNT(*) * 1.0 / 30 AS daily_avg
-            FROM posts
-            WHERE published_at >= datetime('now', '-31 days')
-              AND published_at < datetime('now', '-1 day')
+        baseline AS (
+            SELECT symbol, COUNT(*) * 1.0 / 7 AS daily_avg
+            FROM posts WHERE published_at >= {since_7d}
+              AND published_at < {since_24h}
             GROUP BY symbol
         ),
         lp AS (
@@ -123,22 +263,238 @@ def get_signals():
             ) m ON p.symbol = m.symbol AND p.date = m.mx
         )
         SELECT r.symbol,
-               r.cnt                                    AS mentions_24h,
-               ROUND(a.daily_avg, 1)                   AS daily_avg_30d,
-               ROUND(r.cnt * 1.0 / a.daily_avg, 2)     AS ratio,
-               ROUND(lp.close, 2)                       AS price,
-               ROUND(lp.pct_change * 100, 2)            AS pct_change
+               'buzz_spike' AS alert_type,
+               r.cnt AS mentions_24h,
+               ROUND(b.daily_avg, 1) AS baseline_daily,
+               ROUND(r.cnt * 1.0 / b.daily_avg, 2) AS buzz_ratio,
+               ROUND(lp.close, 2) AS price,
+               ROUND(lp.pct_change * 100, 2) AS pct_change
         FROM recent r
-        JOIN avg30 a ON r.symbol = a.symbol
-        JOIN lp    ON r.symbol = lp.symbol
-        WHERE r.cnt >= a.daily_avg * 1.5
+        JOIN baseline b ON r.symbol = b.symbol
+        JOIN lp ON r.symbol = lp.symbol
+        WHERE r.cnt >= b.daily_avg * 1.5
           AND ABS(lp.pct_change) < 0.03
-        ORDER BY ratio DESC
-    """)
-    return {"total": len(rows), "description": "mentions_24h >= 1.5x 30d avg AND abs(price_change) < 3%", "data": rows}
+        ORDER BY buzz_ratio DESC
+        LIMIT {ph}
+    """, (limit,))
+
+    sentiment_shifts = query(f"""
+        WITH recent_4h AS (
+            SELECT symbol,
+                   ROUND(
+                       (SUM(CASE WHEN sentiment='Bullish' THEN 1.0 ELSE 0 END) -
+                        SUM(CASE WHEN sentiment='Bearish' THEN 1.0 ELSE 0 END))
+                       / NULLIF(COUNT(*), 0), 4
+                   ) AS score_4h,
+                   COUNT(*) AS cnt_4h
+            FROM posts WHERE published_at >= {since_4h}
+            GROUP BY symbol
+        ),
+        baseline_24h AS (
+            SELECT symbol,
+                   ROUND(
+                       (SUM(CASE WHEN sentiment='Bullish' THEN 1.0 ELSE 0 END) -
+                        SUM(CASE WHEN sentiment='Bearish' THEN 1.0 ELSE 0 END))
+                       / NULLIF(COUNT(*), 0), 4
+                   ) AS score_24h
+            FROM posts WHERE published_at >= {since_24h}
+            GROUP BY symbol
+        )
+        SELECT r.symbol,
+               'sentiment_shift' AS alert_type,
+               r.score_4h,
+               b.score_24h,
+               ROUND(r.score_4h - b.score_24h, 4) AS delta,
+               r.cnt_4h AS mentions_4h
+        FROM recent_4h r
+        JOIN baseline_24h b ON r.symbol = b.symbol
+        WHERE ABS(r.score_4h - b.score_24h) > 0.3
+          AND r.cnt_4h >= 5
+        ORDER BY ABS(r.score_4h - b.score_24h) DESC
+        LIMIT {ph}
+    """, (limit,))
+
+    alerts = buzz_spikes + sentiment_shifts
+    alerts.sort(key=lambda x: x.get("buzz_ratio") or abs(x.get("delta", 0)), reverse=True)
+
+    return {
+        "total": len(alerts),
+        "buzz_spikes": len(buzz_spikes),
+        "sentiment_shifts": len(sentiment_shifts),
+        "data": alerts[:limit],
+    }
 
 
-@app.get("/api/stats")
+@app.get("/api/signals/sector/{sector}", tags=["ARTI"], dependencies=DEPS)
+def signals_sector(
+    sector: str,
+    window: str = Query("24h", description="时间窗口: 1h | 4h | 24h"),
+):
+    """板块聚合情绪：返回板块整体 sentiment_score 和各 ticker 细分。"""
+    conn = get_conn()
+    pg = _is_pg(conn)
+    conn.close()
+    since = _interval(window, pg)
+    ph = "%s" if pg else "?"
+
+    if sector.lower() == "all":
+        sector_cond = ""
+        params: list = []
+    else:
+        sector_cond = f"AND LOWER(s.sector) LIKE {ph}"
+        params = [f"%{sector.lower()}%"]
+
+    tickers = query(f"""
+        SELECT p.symbol,
+               COALESCE(s.sector, '') AS sector,
+               COUNT(*) AS mentions,
+               SUM(CASE WHEN p.sentiment='Bullish' THEN 1 ELSE 0 END) AS bullish_count,
+               SUM(CASE WHEN p.sentiment='Bearish' THEN 1 ELSE 0 END) AS bearish_count,
+               ROUND(
+                   (SUM(CASE WHEN p.sentiment='Bullish' THEN 1.0 ELSE 0 END) -
+                    SUM(CASE WHEN p.sentiment='Bearish' THEN 1.0 ELSE 0 END))
+                   / NULLIF(COUNT(*), 0), 4
+               ) AS sentiment_score
+        FROM posts p
+        LEFT JOIN symbols s ON p.symbol = s.symbol
+        WHERE p.published_at >= {since}
+          {sector_cond}
+        GROUP BY p.symbol, s.sector
+        ORDER BY mentions DESC
+    """, tuple(params))
+
+    if not tickers:
+        raise HTTPException(status_code=404, detail=f"No data for sector '{sector}'")
+
+    total_mentions = sum(r["mentions"] for r in tickers)
+    total_bullish  = sum(r["bullish_count"] for r in tickers)
+    total_bearish  = sum(r["bearish_count"] for r in tickers)
+    agg_score = round((total_bullish - total_bearish) / total_mentions, 4) if total_mentions else 0
+
+    return {
+        "sector": sector,
+        "window": window,
+        "total_mentions": total_mentions,
+        "sentiment_score": agg_score,
+        "bullish_count": total_bullish,
+        "bearish_count": total_bearish,
+        "tickers": tickers,
+    }
+
+
+@app.get("/api/signals/feed/{symbol}", tags=["ARTI"], dependencies=DEPS)
+def signals_feed(
+    symbol:    str,
+    sentiment: Optional[str] = Query(None, description="Bullish | Bearish"),
+    cursor:    Optional[str] = Query(None, description="分页游标 (published_at ISO string)"),
+    limit:     int           = Query(20, ge=1, le=100),
+):
+    """原始帖子流，支持 cursor 翻页（按 published_at 倒序）。"""
+    sym = symbol.upper()
+    conn = get_conn()
+    pg = _is_pg(conn)
+    conn.close()
+    ph = "%s" if pg else "?"
+
+    conditions = [f"symbol = {ph}"]
+    params: list = [sym]
+
+    if sentiment:
+        conditions.append(f"sentiment = {ph}")
+        params.append(sentiment)
+    if cursor:
+        conditions.append(f"published_at < {ph}")
+        params.append(cursor)
+
+    where = "WHERE " + " AND ".join(conditions)
+    params.append(limit)
+
+    rows = query(f"""
+        SELECT id, symbol, body, sentiment, likes, username, published_at
+        FROM posts
+        {where}
+        ORDER BY published_at DESC
+        LIMIT {ph}
+    """, tuple(params))
+
+    next_cursor = rows[-1]["published_at"] if len(rows) == limit else None
+
+    return {
+        "symbol": sym,
+        "count": len(rows),
+        "next_cursor": next_cursor,
+        "data": rows,
+    }
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Legacy endpoints (保留向后兼容)
+# ══════════════════════════════════════════════════════════════════════════════
+
+@app.get("/api/posts", tags=["Legacy"])
+def get_posts(
+    symbol:    Optional[str] = Query(None),
+    source:    Optional[str] = Query(None),
+    sentiment: Optional[str] = Query(None),
+    limit:     int           = Query(50, ge=1, le=500),
+    offset:    int           = Query(0, ge=0),
+):
+    conn = get_conn()
+    pg = _is_pg(conn)
+    conn.close()
+    ph = "%s" if pg else "?"
+
+    conditions, params = [], []
+    if symbol:
+        conditions.append(f"symbol = {ph}")
+        params.append(symbol.upper())
+    if source:
+        conditions.append(f"source = {ph}")
+        params.append(source)
+    if sentiment:
+        conditions.append(f"sentiment = {ph}")
+        params.append(sentiment)
+
+    where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
+    params += [limit, offset]
+
+    rows = query(
+        f"SELECT * FROM posts {where} ORDER BY published_at DESC LIMIT {ph} OFFSET {ph}",
+        tuple(params),
+    )
+    return {"total": len(rows), "offset": offset, "data": rows}
+
+
+@app.get("/api/trending", tags=["Legacy"])
+def get_trending(days: int = Query(30, ge=1, le=90), limit: int = Query(25, ge=1, le=100)):
+    conn = get_conn()
+    pg = _is_pg(conn)
+    conn.close()
+    ph = "%s" if pg else "?"
+
+    if pg:
+        since = f"NOW() - INTERVAL '{days} days'"
+    else:
+        since = f"datetime('now', '-{days} days')"
+
+    rows = query(f"""
+        SELECT p.symbol,
+               COALESCE(s.sector, '') AS sector,
+               COUNT(*) AS mentions,
+               SUM(CASE WHEN p.sentiment='Bullish' THEN 1 ELSE 0 END) AS bullish,
+               SUM(CASE WHEN p.sentiment='Bearish' THEN 1 ELSE 0 END) AS bearish,
+               ROUND(COUNT(*) * 1.0 / {ph}, 1) AS daily_avg
+        FROM posts p
+        LEFT JOIN symbols s ON p.symbol = s.symbol
+        WHERE p.published_at >= {since}
+        GROUP BY p.symbol, s.sector
+        ORDER BY mentions DESC
+        LIMIT {ph}
+    """, (days, limit))
+    return {"days": days, "total": len(rows), "data": rows}
+
+
+@app.get("/api/stats", tags=["Legacy"])
 def get_stats():
     stats = query("""
         SELECT COUNT(*) AS total,
@@ -160,15 +516,8 @@ def get_stats():
         WHERE sentiment != '' GROUP BY sentiment ORDER BY cnt DESC
     """)
 
-    trending_now = query("""
-        SELECT symbol, COUNT(*) AS cnt FROM posts
-        WHERE source='trending' AND published_at >= datetime('now', '-1 hour')
-        GROUP BY symbol ORDER BY cnt DESC LIMIT 10
-    """)
-
     return {
-        "overview":      stats,
-        "by_symbol":     by_symbol,
-        "by_sentiment":  by_sentiment,
-        "trending_now":  trending_now,
+        "overview":     stats,
+        "by_symbol":    by_symbol,
+        "by_sentiment": by_sentiment,
     }

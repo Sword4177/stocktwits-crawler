@@ -1,7 +1,13 @@
+import os
 from pathlib import Path
+from dotenv import load_dotenv
+
+load_dotenv()
 
 BASE_DIR        = Path(__file__).parent
-DB_FILE         = str(BASE_DIR / "stocktwits.db")
-POLL_INTERVAL   = 300        # 每5分钟抓一次
-TRENDING_LIMIT  = 30         # 抓trending前30条
-SYMBOL_LIMIT    = 30         # 每个symbol抓最新30条
+DB_FILE         = str(BASE_DIR / "stocktwits.db")   # SQLite fallback (local dev)
+DATABASE_URL    = os.getenv("DATABASE_URL", "")      # PostgreSQL on Railway
+API_KEY         = os.getenv("API_KEY", "")           # X-API-Key auth
+POLL_INTERVAL   = 300
+TRENDING_LIMIT  = 30
+SYMBOL_LIMIT    = 30
