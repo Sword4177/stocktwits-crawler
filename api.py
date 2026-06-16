@@ -103,23 +103,6 @@ def root():
     return {"status": "ok", "service": "SentinelFlow StockTwits API", "version": "2.0.0"}
 
 
-@app.get("/_debug", tags=["Health"])
-def debug():
-    from config import DATABASE_URL
-    conn = get_conn()
-    pg = _is_pg(conn)
-    count = 0
-    if pg:
-        cur = conn.cursor()
-        cur.execute("SELECT COUNT(*) FROM posts")
-        count = cur.fetchone()[0]
-        cur.close()
-    conn.close()
-    return {
-        "db_type": "postgresql" if pg else "sqlite",
-        "db_url_prefix": DATABASE_URL[:40] + "..." if DATABASE_URL else "EMPTY",
-        "post_count": count,
-    }
 
 
 # ══════════════════════════════════════════════════════════════════════════════
