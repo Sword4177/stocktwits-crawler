@@ -262,40 +262,43 @@ def signals_alerts(
         since_4h  = "datetime('now', '-4 hours')"
         since_7d  = "datetime('now', '-7 days')"
 
-    buzz_spikes = query(f"""
-        WITH recent AS (
-            SELECT symbol, COUNT(*) AS cnt
-            FROM posts WHERE published_at >= {since_24h}
-            GROUP BY symbol
-        ),
-        baseline AS (
-            SELECT symbol, COUNT(*) * 1.0 / 7 AS daily_avg
-            FROM posts WHERE published_at >= {since_7d}
-              AND published_at < {since_24h}
-            GROUP BY symbol
-        ),
-        lp AS (
-            SELECT p.symbol, p.close, p.pct_change
-            FROM prices p
-            INNER JOIN (
-                SELECT symbol, MAX(date) AS mx FROM prices GROUP BY symbol
-            ) m ON p.symbol = m.symbol AND p.date = m.mx
-        )
-        SELECT r.symbol,
-               'buzz_spike' AS alert_type,
-               r.cnt AS mentions_24h,
-               ROUND(b.daily_avg, 1) AS baseline_daily,
-               ROUND(r.cnt * 1.0 / b.daily_avg, 2) AS buzz_ratio,
-               ROUND(lp.close, 2) AS price,
-               ROUND(lp.pct_change * 100, 2) AS pct_change
-        FROM recent r
-        JOIN baseline b ON r.symbol = b.symbol
-        JOIN lp ON r.symbol = lp.symbol
-        WHERE r.cnt >= b.daily_avg * 1.5
-          AND ABS(lp.pct_change) < 0.03
-        ORDER BY buzz_ratio DESC
-        LIMIT {ph}
-    """, (limit,))
+    try:
+        buzz_spikes = query(f"""
+            WITH recent AS (
+                SELECT symbol, COUNT(*) AS cnt
+                FROM posts WHERE published_at >= {since_24h}
+                GROUP BY symbol
+            ),
+            baseline AS (
+                SELECT symbol, COUNT(*) * 1.0 / 7 AS daily_avg
+                FROM posts WHERE published_at >= {since_7d}
+                  AND published_at < {since_24h}
+                GROUP BY symbol
+            ),
+            lp AS (
+                SELECT p.symbol, p.close, p.pct_change
+                FROM prices p
+                INNER JOIN (
+                    SELECT symbol, MAX(date) AS mx FROM prices GROUP BY symbol
+                ) m ON p.symbol = m.symbol AND p.date = m.mx
+            )
+            SELECT r.symbol,
+                   'buzz_spike' AS alert_type,
+                   r.cnt AS mentions_24h,
+                   ROUND(b.daily_avg, 1) AS baseline_daily,
+                   ROUND(r.cnt * 1.0 / b.daily_avg, 2) AS buzz_ratio,
+                   ROUND(lp.close, 2) AS price,
+                   ROUND(lp.pct_change * 100, 2) AS pct_change
+            FROM recent r
+            JOIN baseline b ON r.symbol = b.symbol
+            JOIN lp ON r.symbol = lp.symbol
+            WHERE r.cnt >= b.daily_avg * 1.5
+              AND ABS(lp.pct_change) < 0.03
+            ORDER BY buzz_ratio DESC
+            LIMIT {ph}
+        """, (limit,))
+    except Exception:
+        buzz_spikes = []
 
     sentiment_shifts = query(f"""
         WITH recent_4h AS (
