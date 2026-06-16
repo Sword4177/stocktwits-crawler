@@ -105,6 +105,22 @@ def root():
 
 
 
+SECTOR_MAP = {
+    "semiconductor": "半导体",
+    "tech": "科技",
+    "ai": "科技",
+    "finance": "金融",
+    "energy": "能源",
+    "consumer": "消费",
+    "healthcare": "医疗",
+    "crypto": "加密货币",
+}
+
+
+def _sector_cn(sector: str) -> str:
+    return SECTOR_MAP.get(sector.lower(), sector)
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # ARTI Endpoints
 # ══════════════════════════════════════════════════════════════════════════════
@@ -125,8 +141,9 @@ def signals_trending(
     sector_filter = ""
     params: list = []
     if sector and sector != "all":
-        sector_filter = f"AND LOWER(s.sector) LIKE {ph}"
-        params.append(f"%{sector.lower()}%")
+        sector_cn = _sector_cn(sector)
+        sector_filter = f"AND s.sector = {ph}"
+        params.append(sector_cn)
 
     params += [limit]
 
@@ -346,8 +363,9 @@ def signals_sector(
         sector_cond = ""
         params: list = []
     else:
-        sector_cond = f"AND LOWER(s.sector) LIKE {ph}"
-        params = [f"%{sector.lower()}%"]
+        sector_cn = _sector_cn(sector)
+        sector_cond = f"AND s.sector = {ph}"
+        params = [sector_cn]
 
     tickers = query(f"""
         SELECT p.symbol,
