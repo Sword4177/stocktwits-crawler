@@ -241,12 +241,15 @@ def signals_ticker(
 
 @app.get("/api/signals/alerts", tags=["ARTI"], dependencies=DEPS)
 def signals_alerts(
-    limit: int = Query(20, ge=1, le=100),
+    limit:     int            = Query(20, ge=1, le=100),
+    min_spike: float          = Query(1.5, ge=0.1, description="buzz_spike 最低倍数阈值，默认 1.5"),
+    min_delta: float          = Query(0.3, ge=0.0, description="sentiment_shift 最低变化量阈值，默认 0.3"),
+    sector:    Optional[str]  = Query(None, description="板块过滤: semiconductor | tech | ai | all"),
 ):
     """
     实时异动预警：
-    - buzz_spike: 近24h提及量 >= 7日均值 1.5x，且股价变动 < 3%
-    - sentiment_shift: 近4h情绪分 与24h均值偏差 > 0.3
+    - buzz_spike: 近24h提及量 >= 7日均值 min_spike 倍，且股价变动 < 3%
+    - sentiment_shift: 近4h情绪分 与24h均值偏差 > min_delta，且提及量 >= 5
     """
     conn = get_conn()
     pg = _is_pg(conn)
@@ -261,6 +264,15 @@ def signals_alerts(
         since_24h = "datetime('now', '-24 hours')"
         since_4h  = "datetime('now', '-4 hours')"
         since_7d  = "datetime('now', '-7 days')"
+
+    sector_join = ""
+    sector_cond = ""
+    sector_params_pre: list = []
+    if sector and sector.lower() not in ("all", ""):
+        sector_cn = _sector_cn(sector)
+        sector_join = f"JOIN symbols sx ON r.symbol = sx.symbol"
+        sector_cond = f"AND sx.sector = {ph}"
+        sector_params_pre = [sector_cn]
 
     try:
         buzz_spikes = query(f"""
@@ -292,11 +304,13 @@ def signals_alerts(
             FROM recent r
             JOIN baseline b ON r.symbol = b.symbol
             JOIN lp ON r.symbol = lp.symbol
-            WHERE r.cnt >= b.daily_avg * 1.5
+            {sector_join}
+            WHERE r.cnt >= b.daily_avg * {ph}
               AND ABS(lp.pct_change) < 0.03
+              {sector_cond}
             ORDER BY buzz_ratio DESC
             LIMIT {ph}
-        """, (limit,))
+        """, tuple([min_spike] + sector_params_pre + [limit]))
     except Exception:
         buzz_spikes = []
 
@@ -330,11 +344,13 @@ def signals_alerts(
                r.cnt_4h AS mentions_4h
         FROM recent_4h r
         JOIN baseline_24h b ON r.symbol = b.symbol
-        WHERE ABS(r.score_4h - b.score_24h) > 0.3
+        {sector_join}
+        WHERE ABS(r.score_4h - b.score_24h) > {ph}
           AND r.cnt_4h >= 5
+          {sector_cond}
         ORDER BY ABS(r.score_4h - b.score_24h) DESC
         LIMIT {ph}
-    """, (limit,))
+    """, tuple([min_delta] + sector_params_pre + [limit]))
 
     alerts = buzz_spikes + sentiment_shifts
     alerts.sort(key=lambda x: x.get("buzz_ratio") or abs(x.get("delta", 0)), reverse=True)

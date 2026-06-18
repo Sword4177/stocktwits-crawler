@@ -11,8 +11,10 @@
 所有 `/api/signals/*` 端点需要在请求头中携带 API Key：
 
 ```
-X-API-Key: stocktwits-2026
+X-API-Key: YOUR_API_KEY
 ```
+
+API Key 通过私信或飞书单独发放，请勿在代码中硬编码或公开分享。
 
 **无 key 或错误 key 返回：**
 ```json
@@ -38,12 +40,14 @@ HTTP 状态码：`401`
 |-----------|---------|-----------------|
 | `semiconductor` | 半导体 | MU, SNDK, AVGO, ARM, TSM, AMAT, LRCX, ASML, MRVL |
 | `tech` | 科技 | NVDA, AMD, MSFT, AAPL, INTC, QCOM, SMCI |
-| `ai` | 科技 | GOOGL, META（同科技板块）|
+| `ai` | 科技（与 `tech` 等价） | GOOGL, META（同科技板块）|
 | `consumer` | 消费 | TSLA, BABA, NIO, JD, PDD |
 | `finance` | 金融 | JPM, GS, BAC |
 | `energy` | 能源 | XOM, CVX |
 | `crypto` | 加密货币 | — |
 | `all` | 全部 | 所有 ticker |
+
+> **注意**：`sector=ai` 与 `sector=tech` 完全等价，两者都查询科技板块（数据库中统一存储为「科技」）。推荐统一使用 `tech`。
 
 ---
 
@@ -85,7 +89,7 @@ curl https://stocktwits-crawler-production.up.railway.app/
 
 **curl 示例：**
 ```bash
-curl -H "X-API-Key: stocktwits-2026" \
+curl -H "X-API-Key: YOUR_API_KEY" \
   "https://stocktwits-crawler-production.up.railway.app/api/signals/trending?window=24h&limit=3"
 ```
 
@@ -95,7 +99,7 @@ import requests
 
 resp = requests.get(
     "https://stocktwits-crawler-production.up.railway.app/api/signals/trending",
-    headers={"X-API-Key": "stocktwits-2026"},
+    headers={"X-API-Key": "YOUR_API_KEY"},
     params={"window": "24h", "limit": 3}
 )
 print(resp.json())
@@ -143,7 +147,7 @@ print(resp.json())
 | `mentions` | 时间窗口内提及次数 |
 | `bullish_count` | Bullish 帖子数量 |
 | `bearish_count` | Bearish 帖子数量 |
-| `sentiment_score` | (bullish - bearish) / total，范围 -1 到 +1 |
+| `sentiment_score` | (bullish - bearish) / total，范围 **-1 到 +1**，> 0 偏多，< 0 偏空 |
 
 ---
 
@@ -161,7 +165,7 @@ print(resp.json())
 
 **curl 示例：**
 ```bash
-curl -H "X-API-Key: stocktwits-2026" \
+curl -H "X-API-Key: YOUR_API_KEY" \
   "https://stocktwits-crawler-production.up.railway.app/api/signals/ticker/NVDA?window=24h"
 ```
 
@@ -183,20 +187,6 @@ curl -H "X-API-Key: stocktwits-2026" \
       "sentiment": "",
       "likes": 0,
       "published_at": "2026-06-17T05:58:36+00:00"
-    },
-    {
-      "id": "656669005",
-      "body": "$NVDA and $META are also goofy cheap… get ready for liftoff",
-      "sentiment": "",
-      "likes": 0,
-      "published_at": "2026-06-17T05:50:48+00:00"
-    },
-    {
-      "id": "656668573",
-      "body": "$NVDA We keep our investments in house",
-      "sentiment": "Bullish",
-      "likes": 0,
-      "published_at": "2026-06-17T05:25:48+00:00"
     }
   ]
 }
@@ -206,8 +196,10 @@ curl -H "X-API-Key: stocktwits-2026" \
 
 | 字段 | 说明 |
 |------|------|
-| `buzz_baseline_per_window` | 7日同窗口均值提及量 |
-| `buzz_ratio` | mentions / baseline，>1.5 表示热度异常 |
+| `mentions` | 时间窗口内提及次数 |
+| `sentiment_score` | 范围 **-1 到 +1**，> 0 偏多，< 0 偏空 |
+| `buzz_baseline_per_window` | 过去 7 天同长度窗口的平均提及量（7日每日均值 × 窗口小时数 / 24）|
+| `buzz_ratio` | mentions / buzz_baseline_per_window；**> 1.5** 表示当前热度明显高于基线，< 1 表示低于正常水平 |
 | `top_posts` | 点赞数最高的 3 条帖子 |
 
 ---
@@ -221,15 +213,27 @@ curl -H "X-API-Key: stocktwits-2026" \
 | 参数 | 类型 | 必填 | 默认值 | 说明 |
 |------|------|------|--------|------|
 | `limit` | int | 否 | 20 | 返回条数（1-100）|
+| `min_spike` | float | 否 | 1.5 | buzz_spike 触发阈值：近 24h 提及量需达到 7 日均值的 min_spike 倍才触发 |
+| `min_delta` | float | 否 | 0.3 | sentiment_shift 触发阈值：近 4h 与近 24h 情绪分差值需超过 min_delta 才触发 |
+| `sector` | string | 否 | all | 板块过滤，见上方板块可用值 |
 
 **触发规则：**
-- `buzz_spike`：近 24h 提及量 ≥ 7 日均值 1.5x，且股价变动 < 3%
-- `sentiment_shift`：近 4h 情绪分与 24h 均值偏差 > 0.3，且提及量 ≥ 5 条
+- `buzz_spike`：近 24h 提及量 ≥ 7 日均值 × min_spike，且股价变动 < 3%
+- `sentiment_shift`：近 4h 情绪分与 24h 均值偏差 > min_delta，且提及量 ≥ 5 条
 
 **curl 示例：**
 ```bash
-curl -H "X-API-Key: stocktwits-2026" \
+# 默认阈值（min_spike=1.5，min_delta=0.3）
+curl -H "X-API-Key: YOUR_API_KEY" \
   "https://stocktwits-crawler-production.up.railway.app/api/signals/alerts"
+
+# 放宽阈值，更容易触发（min_spike=1.0）
+curl -H "X-API-Key: YOUR_API_KEY" \
+  "https://stocktwits-crawler-production.up.railway.app/api/signals/alerts?min_spike=1.0&min_delta=0.2"
+
+# 只看半导体板块
+curl -H "X-API-Key: YOUR_API_KEY" \
+  "https://stocktwits-crawler-production.up.railway.app/api/signals/alerts?sector=semiconductor"
 ```
 
 **真实返回：**
@@ -256,10 +260,12 @@ curl -H "X-API-Key: stocktwits-2026" \
 | 字段 | 说明 |
 |------|------|
 | `alert_type` | `buzz_spike` 或 `sentiment_shift` |
-| `score_4h` | 近 4h 情绪分 |
-| `score_24h` | 近 24h 情绪分（基准） |
-| `delta` | 情绪分变化量 |
+| `score_4h` | 近 4h 情绪分（-1 到 +1）|
+| `score_24h` | 近 24h 情绪分（基准）|
+| `delta` | 情绪分变化量，正值代表近期更偏多头 |
 | `mentions_4h` | 近 4h 提及次数 |
+
+> **提示**：`total=0` 时说明当前没有达到阈值的异动。可降低 `min_spike` 或 `min_delta` 来查看更多候选信号。
 
 ---
 
@@ -277,7 +283,7 @@ curl -H "X-API-Key: stocktwits-2026" \
 
 **curl 示例：**
 ```bash
-curl -H "X-API-Key: stocktwits-2026" \
+curl -H "X-API-Key: YOUR_API_KEY" \
   "https://stocktwits-crawler-production.up.railway.app/api/signals/sector/semiconductor?window=24h"
 ```
 
@@ -306,34 +312,17 @@ curl -H "X-API-Key: stocktwits-2026" \
       "bullish_count": 16,
       "bearish_count": 42,
       "sentiment_score": -0.2261
-    },
-    {
-      "symbol": "AVGO",
-      "sector": "半导体",
-      "mentions": 54,
-      "bullish_count": 23,
-      "bearish_count": 3,
-      "sentiment_score": 0.3704
-    },
-    {
-      "symbol": "ARM",
-      "sector": "半导体",
-      "mentions": 43,
-      "bullish_count": 1,
-      "bearish_count": 6,
-      "sentiment_score": -0.1163
-    },
-    {
-      "symbol": "TSM",
-      "sector": "半导体",
-      "mentions": 13,
-      "bullish_count": 4,
-      "bearish_count": 0,
-      "sentiment_score": 0.3077
     }
   ]
 }
 ```
+
+**字段说明：**
+
+| 字段 | 说明 |
+|------|------|
+| `sentiment_score` | 板块整体情绪分，范围 **-1 到 +1** |
+| `tickers` | 板块内各 ticker 明细，按提及量降序 |
 
 ---
 
@@ -354,11 +343,11 @@ curl -H "X-API-Key: stocktwits-2026" \
 **curl 示例：**
 ```bash
 # 第一页
-curl -H "X-API-Key: stocktwits-2026" \
+curl -H "X-API-Key: YOUR_API_KEY" \
   "https://stocktwits-crawler-production.up.railway.app/api/signals/feed/NVDA?limit=2"
 
 # 翻页（填入上次返回的 next_cursor）
-curl -H "X-API-Key: stocktwits-2026" \
+curl -H "X-API-Key: YOUR_API_KEY" \
   "https://stocktwits-crawler-production.up.railway.app/api/signals/feed/NVDA?limit=2&cursor=2026-06-17T05:50:48+00:00"
 ```
 
@@ -407,3 +396,17 @@ curl -H "X-API-Key: stocktwits-2026" \
 ```
 https://stocktwits-crawler-production.up.railway.app/docs
 ```
+
+---
+
+## 旧版端点（已废弃）
+
+以下端点为早期版本保留，**不推荐新接入方使用**，未来可能移除：
+
+| 端点 | 替代接口 |
+|------|---------|
+| `GET /api/trending` | `GET /api/signals/trending` |
+| `GET /api/posts` | `GET /api/signals/feed/{symbol}` |
+| `GET /api/stats` | — |
+
+旧版 `/api/trending` 参数为 `days`（天数），返回字段与新版不同，不含 `sentiment_score`。
