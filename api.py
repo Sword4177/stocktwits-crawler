@@ -4,6 +4,8 @@ api.py — FastAPI 对外接口
 """
 import time
 import json
+import asyncio
+import logging
 from collections import defaultdict
 from typing import Optional
 from fastapi import FastAPI, Query, Depends, HTTPException, Request
@@ -11,6 +13,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from database import get_conn, init_db
 from config import API_KEY
+
+logger = logging.getLogger(__name__)
 
 app = FastAPI(
     title="StockTwits Sentiment API",
@@ -90,11 +94,79 @@ def _interval(window: str, pg: bool) -> str:
     return f"datetime('now', '{sqlite_delta}')"
 
 
+def _write_snapshots() -> None:
+    """每5分钟写入一次 ticker_signals 快照（仅 PostgreSQL）。"""
+    conn = get_conn()
+    if not _is_pg(conn):
+        conn.close()
+        return
+    try:
+        import psycopg2.extras
+        cur = conn.cursor()
+
+        # 7日基线（一次查全量）
+        cur.execute("""
+            SELECT symbol, COUNT(*) * 1.0 / 7 AS daily_avg
+            FROM posts WHERE published_at >= NOW() - INTERVAL '7 days'
+            GROUP BY symbol
+        """)
+        baseline = {row[0]: row[1] for row in cur.fetchall()}
+
+        rows: list = []
+        for window, hours in [("1h", 1), ("4h", 4), ("24h", 24)]:
+            cur.execute(f"""
+                SELECT symbol,
+                       COUNT(*) AS mentions,
+                       SUM(CASE WHEN sentiment='Bullish' THEN 1 ELSE 0 END),
+                       SUM(CASE WHEN sentiment='Bearish' THEN 1 ELSE 0 END),
+                       ROUND(
+                           (SUM(CASE WHEN sentiment='Bullish' THEN 1.0 ELSE 0 END) -
+                            SUM(CASE WHEN sentiment='Bearish' THEN 1.0 ELSE 0 END))
+                           / NULLIF(COUNT(*), 0), 4
+                       )
+                FROM posts
+                WHERE published_at >= NOW() - INTERVAL '{hours} hours'
+                GROUP BY symbol
+                HAVING COUNT(*) > 0
+            """)
+            for sym, mentions, bullish, bearish, score in cur.fetchall():
+                daily_avg  = baseline.get(sym, 0)
+                window_base = daily_avg / 24 * hours if daily_avg else 0
+                buzz_ratio  = round(mentions / window_base, 2) if window_base else 0
+                rows.append((sym, window, int(mentions), int(bullish), int(bearish),
+                             float(score or 0), round(window_base, 1), buzz_ratio))
+
+        if rows:
+            psycopg2.extras.execute_values(cur, """
+                INSERT INTO ticker_signals
+                  (symbol, time_window, mentions, bullish_count, bearish_count,
+                   sentiment_score, buzz_baseline, buzz_ratio)
+                VALUES %s
+            """, rows)
+            conn.commit()
+            logger.info("ticker_signals: wrote %d rows", len(rows))
+    except Exception as e:
+        logger.error("snapshot write failed: %s", e)
+        conn.rollback()
+    finally:
+        conn.close()
+
+
+async def _snapshot_loop() -> None:
+    while True:
+        await asyncio.sleep(300)
+        try:
+            _write_snapshots()
+        except Exception as e:
+            logger.error("snapshot loop error: %s", e)
+
+
 @app.on_event("startup")
-def startup():
+async def startup():
     conn = get_conn()
     init_db(conn)
     conn.close()
+    asyncio.create_task(_snapshot_loop())
 
 
 # ── Health ─────────────────────────────────────────────────────────────────────
