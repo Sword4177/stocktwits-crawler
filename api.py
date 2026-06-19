@@ -136,6 +136,7 @@ def signals_trending(
     pg = _is_pg(conn)
     conn.close()
     since = _interval(window, pg)
+    hours = {"1h": 1, "4h": 4, "24h": 24}.get(window, 24)
     ph = "%s" if pg else "?"
 
     sector_filter = ""
@@ -147,7 +148,7 @@ def signals_trending(
 
     params += [limit]
 
-    sql = f"""
+    rows = query(f"""
         SELECT p.symbol,
                COALESCE(s.sector, '') AS sector,
                COUNT(*) AS mentions,
@@ -165,8 +166,29 @@ def signals_trending(
         GROUP BY p.symbol, s.sector
         ORDER BY mentions DESC
         LIMIT {ph}
-    """
-    rows = query(sql, tuple(params))
+    """, tuple(params))
+
+    # 7-day baseline for spike_ratio
+    if pg:
+        since_7d = "NOW() - INTERVAL '7 days'"
+    else:
+        since_7d = "datetime('now', '-7 days')"
+
+    baseline_rows = query(f"""
+        SELECT symbol, COUNT(*) * 1.0 / 7 AS daily_avg
+        FROM posts WHERE published_at >= {since_7d}
+        GROUP BY symbol
+    """)
+    baseline = {r["symbol"]: r["daily_avg"] for r in baseline_rows}
+
+    for r in rows:
+        m = r["mentions"]
+        daily_avg = baseline.get(r["symbol"], 0)
+        window_baseline = daily_avg / 24 * hours if daily_avg else None
+        r["bullish_pct"]  = round(r["bullish_count"] * 100.0 / m, 1) if m else 0
+        r["bearish_pct"]  = round(r["bearish_count"] * 100.0 / m, 1) if m else 0
+        r["spike_ratio"]  = round(m / window_baseline, 2) if window_baseline else None
+
     return {"window": window, "sector": sector or "all", "total": len(rows), "data": rows}
 
 
@@ -226,15 +248,44 @@ def signals_ticker(
         LIMIT 3
     """, (sym,))
 
+    # delta_1h: 1h sentiment vs current window sentiment
+    delta_1h = None
+    if window != "1h":
+        agg_1h = query(f"""
+            SELECT ROUND(
+                       (SUM(CASE WHEN sentiment='Bullish' THEN 1.0 ELSE 0 END) -
+                        SUM(CASE WHEN sentiment='Bearish' THEN 1.0 ELSE 0 END))
+                       / NULLIF(COUNT(*), 0), 4
+                   ) AS score_1h
+            FROM posts
+            WHERE symbol = {ph} AND published_at >= {_interval('1h', pg)}
+        """, (sym,))
+        score_1h = agg_1h[0]["score_1h"] if agg_1h else None
+        if score_1h is not None and agg[0]["sentiment_score"] is not None:
+            delta_1h = round(score_1h - agg[0]["sentiment_score"], 4)
+
+    bullish_count = agg[0]["bullish_count"]
+    bearish_count = agg[0]["bearish_count"]
+    neutral_count = mentions - bullish_count - bearish_count
+    bullish_pct   = round(bullish_count * 100.0 / mentions, 1) if mentions else 0
+    bearish_pct   = round(bearish_count * 100.0 / mentions, 1) if mentions else 0
+    neutral_pct   = round(neutral_count * 100.0 / mentions, 1) if mentions else 0
+    is_spike      = buzz_ratio is not None and buzz_ratio >= 2.0
+
     return {
         "symbol": sym,
         "window": window,
         "mentions": mentions,
-        "bullish_count": agg[0]["bullish_count"],
-        "bearish_count": agg[0]["bearish_count"],
+        "bullish_count": bullish_count,
+        "bearish_count": bearish_count,
         "sentiment_score": agg[0]["sentiment_score"],
+        "bullish_pct": bullish_pct,
+        "bearish_pct": bearish_pct,
+        "neutral_pct": neutral_pct,
         "buzz_baseline_per_window": round(window_avg, 1),
         "buzz_ratio": buzz_ratio,
+        "is_spike": is_spike,
+        "delta_1h": delta_1h,
         "top_posts": top3,
     }
 
@@ -242,8 +293,8 @@ def signals_ticker(
 @app.get("/api/signals/alerts", tags=["ARTI"], dependencies=DEPS)
 def signals_alerts(
     limit:     int            = Query(20, ge=1, le=100),
-    min_spike: float          = Query(1.5, ge=0.1, description="buzz_spike 最低倍数阈值，默认 1.5"),
-    min_delta: float          = Query(0.3, ge=0.0, description="sentiment_shift 最低变化量阈值，默认 0.3"),
+    min_spike: float          = Query(2.0, ge=0.1, description="buzz_spike 最低倍数阈值，默认 2.0"),
+    min_delta: float          = Query(0.15, ge=0.0, description="sentiment_shift 最低变化量阈值，默认 0.15"),
     sector:    Optional[str]  = Query(None, description="板块过滤: semiconductor | tech | ai | all"),
 ):
     """
@@ -410,6 +461,13 @@ def signals_sector(
     total_bearish  = sum(r["bearish_count"] for r in tickers)
     agg_score = round((total_bullish - total_bearish) / total_mentions, 4) if total_mentions else 0
 
+    # top_movers: top 3 by sentiment_score with at least 5 mentions
+    top_movers = sorted(
+        [t for t in tickers if t["mentions"] >= 5],
+        key=lambda x: x["sentiment_score"],
+        reverse=True
+    )[:3]
+
     return {
         "sector": sector,
         "window": window,
@@ -417,6 +475,7 @@ def signals_sector(
         "sentiment_score": agg_score,
         "bullish_count": total_bullish,
         "bearish_count": total_bearish,
+        "top_movers": top_movers,
         "tickers": tickers,
     }
 
