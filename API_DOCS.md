@@ -148,6 +148,9 @@ print(resp.json())
 | `bullish_count` | Bullish 帖子数量 |
 | `bearish_count` | Bearish 帖子数量 |
 | `sentiment_score` | (bullish - bearish) / total，范围 **-1 到 +1**，> 0 偏多，< 0 偏空 |
+| `bullish_pct` | Bullish 占比（%），如 37.7 |
+| `bearish_pct` | Bearish 占比（%） |
+| `spike_ratio` | 当前窗口提及量 / 7日同窗口均值；> 2.0 为热度异常 |
 
 ---
 
@@ -198,8 +201,13 @@ curl -H "X-API-Key: YOUR_API_KEY" \
 |------|------|
 | `mentions` | 时间窗口内提及次数 |
 | `sentiment_score` | 范围 **-1 到 +1**，> 0 偏多，< 0 偏空 |
+| `bullish_pct` | Bullish 占比（%） |
+| `bearish_pct` | Bearish 占比（%） |
+| `neutral_pct` | 未标注情绪占比（%） |
 | `buzz_baseline_per_window` | 过去 7 天同长度窗口的平均提及量（7日每日均值 × 窗口小时数 / 24）|
-| `buzz_ratio` | mentions / buzz_baseline_per_window；**> 1.5** 表示当前热度明显高于基线，< 1 表示低于正常水平 |
+| `buzz_ratio` | mentions / buzz_baseline_per_window；**> 2.0** 触发 is_spike，< 1 表示低于正常水平 |
+| `is_spike` | 布尔值，buzz_ratio ≥ 2.0 时为 true |
+| `delta_1h` | 近 1h 情绪分 − 当前窗口情绪分，反映短期情绪变化；window=1h 时为 null |
 | `top_posts` | 点赞数最高的 3 条帖子 |
 
 ---
@@ -322,6 +330,7 @@ curl -H "X-API-Key: YOUR_API_KEY" \
 | 字段 | 说明 |
 |------|------|
 | `sentiment_score` | 板块整体情绪分，范围 **-1 到 +1** |
+| `top_movers` | 情绪分最高的 3 个 ticker（最少 5 条提及），代表板块内最乐观标的 |
 | `tickers` | 板块内各 ticker 明细，按提及量降序 |
 
 ---
