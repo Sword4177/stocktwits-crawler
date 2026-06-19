@@ -152,11 +152,57 @@ def _write_snapshots() -> None:
         conn.close()
 
 
+def _check_alert_frequency() -> None:
+    """当 sentiment_shift 触发数超过 15 时打 WARNING，提示阈值可能需要上调。"""
+    conn = get_conn()
+    if not _is_pg(conn):
+        conn.close()
+        return
+    try:
+        cur = conn.cursor()
+        cur.execute("""
+            WITH recent_4h AS (
+                SELECT symbol,
+                       ROUND(
+                           (SUM(CASE WHEN sentiment='Bullish' THEN 1.0 ELSE 0 END) -
+                            SUM(CASE WHEN sentiment='Bearish' THEN 1.0 ELSE 0 END))
+                           / NULLIF(COUNT(*), 0), 4
+                       ) AS score_4h,
+                       COUNT(*) AS cnt_4h
+                FROM posts WHERE published_at >= NOW() - INTERVAL '4 hours'
+                GROUP BY symbol
+            ),
+            baseline_24h AS (
+                SELECT symbol,
+                       ROUND(
+                           (SUM(CASE WHEN sentiment='Bullish' THEN 1.0 ELSE 0 END) -
+                            SUM(CASE WHEN sentiment='Bearish' THEN 1.0 ELSE 0 END))
+                           / NULLIF(COUNT(*), 0), 4
+                       ) AS score_24h
+                FROM posts WHERE published_at >= NOW() - INTERVAL '24 hours'
+                GROUP BY symbol
+            )
+            SELECT COUNT(*) FROM recent_4h r
+            JOIN baseline_24h b ON r.symbol = b.symbol
+            WHERE ABS(r.score_4h - b.score_24h) > 0.15 AND r.cnt_4h >= 5
+        """)
+        count = cur.fetchone()[0]
+        if count > 15:
+            logger.warning("ALERT_FREQ_HIGH: sentiment_shift=%d (>15), consider raising min_delta", count)
+        else:
+            logger.info("alert_check: sentiment_shift=%d (OK)", count)
+    except Exception as e:
+        logger.error("alert check failed: %s", e)
+    finally:
+        conn.close()
+
+
 async def _snapshot_loop() -> None:
     while True:
         await asyncio.sleep(300)
         try:
             _write_snapshots()
+            _check_alert_frequency()
         except Exception as e:
             logger.error("snapshot loop error: %s", e)
 
