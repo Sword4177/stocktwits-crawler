@@ -27,16 +27,21 @@ def init_db(conn) -> None:
     if pg:
         cur.execute("""
             CREATE TABLE IF NOT EXISTS posts (
-                id           TEXT PRIMARY KEY,
-                symbol       TEXT NOT NULL,
-                source       TEXT NOT NULL,
-                body         TEXT NOT NULL,
-                sentiment    TEXT DEFAULT '',
-                likes        INTEGER DEFAULT 0,
-                username     TEXT DEFAULT '',
-                published_at TIMESTAMPTZ NOT NULL,
-                collected_at TIMESTAMPTZ NOT NULL
+                id                   TEXT PRIMARY KEY,
+                symbol               TEXT NOT NULL,
+                source               TEXT NOT NULL,
+                body                 TEXT NOT NULL,
+                sentiment            TEXT DEFAULT '',
+                sentiment_confidence REAL DEFAULT 0.0,
+                likes                INTEGER DEFAULT 0,
+                username             TEXT DEFAULT '',
+                published_at         TIMESTAMPTZ NOT NULL,
+                collected_at         TIMESTAMPTZ NOT NULL
             )
+        """)
+        cur.execute("""
+            ALTER TABLE posts ADD COLUMN IF NOT EXISTS
+              sentiment_confidence REAL DEFAULT 0.0
         """)
         cur.execute("""
             CREATE TABLE IF NOT EXISTS symbols (
@@ -121,18 +126,21 @@ def save_post(conn, post_id: str, symbol: str, source: str,
     pg = _is_pg(conn)
     cur = conn.cursor()
     now = datetime.now(timezone.utc).isoformat()
+    confidence = 1.0 if sentiment in ("Bullish", "Bearish") else 0.0
     if pg:
         cur.execute("""
-            INSERT INTO posts (id, symbol, source, body, sentiment, likes, username, published_at, collected_at)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+            INSERT INTO posts (id, symbol, source, body, sentiment, sentiment_confidence,
+                               likes, username, published_at, collected_at)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             ON CONFLICT (id) DO NOTHING
-        """, (post_id, symbol, source, body, sentiment, likes, username, published_at, now))
+        """, (post_id, symbol, source, body, sentiment, confidence, likes, username, published_at, now))
     else:
         cur.execute("""
             INSERT OR IGNORE INTO posts
-              (id, symbol, source, body, sentiment, likes, username, published_at, collected_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (post_id, symbol, source, body, sentiment, likes, username, published_at, now))
+              (id, symbol, source, body, sentiment, sentiment_confidence,
+               likes, username, published_at, collected_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (post_id, symbol, source, body, sentiment, confidence, likes, username, published_at, now))
     conn.commit()
     changed = cur.rowcount > 0
     cur.close()

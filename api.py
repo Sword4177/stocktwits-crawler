@@ -688,7 +688,7 @@ def signals_feed(
     params.append(limit)
 
     rows = query(f"""
-        SELECT id, symbol, body, sentiment, likes, username, published_at
+        SELECT id, symbol, body, sentiment, sentiment_confidence, likes, username, published_at
         FROM posts
         {where}
         ORDER BY published_at DESC
