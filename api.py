@@ -197,12 +197,74 @@ def _check_alert_frequency() -> None:
         conn.close()
 
 
+def _update_prices() -> None:
+    """每日从 yfinance 更新 prices 表（仅 PostgreSQL）。"""
+    conn = get_conn()
+    if not _is_pg(conn):
+        conn.close()
+        return
+    try:
+        import yfinance as yf
+        import pandas as pd
+        import psycopg2.extras
+        cur = conn.cursor()
+        cur.execute("SELECT symbol FROM symbols")
+        symbols = [r[0] for r in cur.fetchall()]
+
+        raw = yf.download(symbols, period="3d", auto_adjust=True,
+                          progress=False, group_by="ticker")
+        rows = []
+        for sym in symbols:
+            try:
+                df = raw[sym] if len(symbols) > 1 else raw
+                if df is None or df.empty:
+                    continue
+                df = df.dropna(subset=["Close"])
+                df["pct_change"] = df["Close"].pct_change()
+                for date, row in df.iterrows():
+                    rows.append((
+                        sym, date.date(),
+                        float(row["Open"])       if not pd.isna(row.get("Open"))       else None,
+                        float(row["High"])       if not pd.isna(row.get("High"))       else None,
+                        float(row["Low"])        if not pd.isna(row.get("Low"))        else None,
+                        float(row["Close"]),
+                        int(row["Volume"])       if not pd.isna(row.get("Volume"))     else None,
+                        float(row["pct_change"]) if not pd.isna(row["pct_change"])     else None,
+                    ))
+            except Exception:
+                pass
+
+        if rows:
+            psycopg2.extras.execute_values(cur, """
+                INSERT INTO prices (symbol, date, open, high, low, close, volume, pct_change)
+                VALUES %s
+                ON CONFLICT (symbol, date) DO UPDATE SET
+                    close=EXCLUDED.close, pct_change=EXCLUDED.pct_change,
+                    high=EXCLUDED.high, low=EXCLUDED.low, volume=EXCLUDED.volume
+            """, rows, page_size=500)
+            conn.commit()
+            logger.info("prices updated: %d rows", len(rows))
+    except Exception as e:
+        logger.error("price update failed: %s", e)
+    finally:
+        conn.close()
+
+
+_last_price_update: float = 0.0
+
+
 async def _snapshot_loop() -> None:
+    global _last_price_update
     while True:
         await asyncio.sleep(300)
         try:
             _write_snapshots()
             _check_alert_frequency()
+            # 每 24 小时更新一次价格
+            now = time.time()
+            if now - _last_price_update > 86400:
+                _update_prices()
+                _last_price_update = now
         except Exception as e:
             logger.error("snapshot loop error: %s", e)
 
