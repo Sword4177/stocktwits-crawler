@@ -537,6 +537,7 @@ def signals_alerts(
             JOIN lp ON r.symbol = lp.symbol
             {sector_join}
             WHERE r.cnt >= b.daily_avg * {ph}
+              AND b.daily_avg >= 5
               AND ABS(lp.pct_change) < 0.03
               {sector_cond}
             ORDER BY buzz_ratio DESC
